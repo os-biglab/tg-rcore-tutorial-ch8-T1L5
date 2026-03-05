@@ -27,7 +27,7 @@ use crate::{
     build_flags, fs::Fd, map_portal, parse_flags, processor::ProcessorInner, Sv39, Sv39Manager,
     PROCESSOR,
 };
-use alloc::{alloc::alloc_zeroed, boxed::Box, sync::Arc, vec::Vec};
+use alloc::{alloc::alloc_zeroed, boxed::Box, collections::{BTreeMap, BTreeSet}, sync::Arc, vec::Vec};
 use core::alloc::Layout;
 use spin::Mutex;
 use tg_kernel_context::{foreign::ForeignContext, LocalContext};
@@ -84,6 +84,18 @@ pub struct Process {
     pub mutex_list: Vec<Option<Arc<dyn MutexTrait>>>,
     /// 条件变量列表（**本章新增**，所有线程共享）
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// 是否启用死锁检测
+    pub deadlock_detect_enabled: bool,
+    /// 互斥锁拥有者（按 mutex_id 索引）
+    pub mutex_owner: Vec<Option<ThreadId>>,
+    /// 互斥锁等待线程集合（按 mutex_id 索引）
+    pub mutex_waiters: Vec<BTreeSet<ThreadId>>,
+    /// 信号量分配矩阵（按 sem_id 索引，记录每个线程已分配计数）
+    pub sem_allocation: Vec<BTreeMap<ThreadId, usize>>,
+    /// 信号量需求矩阵（按 sem_id 索引，记录每个线程等待计数）
+    pub sem_need: Vec<BTreeMap<ThreadId, usize>>,
+    /// 信号量总量（按 sem_id 索引）
+    pub sem_total: Vec<usize>,
 }
 
 impl Process {
@@ -134,6 +146,12 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                deadlock_detect_enabled: false,
+                mutex_owner: Vec::new(),
+                mutex_waiters: Vec::new(),
+                sem_allocation: Vec::new(),
+                sem_need: Vec::new(),
+                sem_total: Vec::new(),
             },
             thread,
         ))
@@ -206,6 +224,12 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                deadlock_detect_enabled: false,
+                mutex_owner: Vec::new(),
+                mutex_waiters: Vec::new(),
+                sem_allocation: Vec::new(),
+                sem_need: Vec::new(),
+                sem_total: Vec::new(),
             },
             thread,
         ))

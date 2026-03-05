@@ -349,11 +349,12 @@ mod impls {
     use crate::{
         build_flags,
         fs::{read_all, Fd, FS},
+        process::Process as ProcStruct,
         processor::ProcessorInner,
         Sv39, Thread, PROCESSOR,
     };
     use alloc::sync::Arc;
-    use alloc::{alloc::alloc_zeroed, string::String, vec::Vec};
+    use alloc::{alloc::{alloc_zeroed, dealloc}, collections::BTreeSet, string::String, vec::Vec};
     use core::{alloc::Layout, ptr::NonNull};
     use spin::Mutex;
     use tg_console::log;
@@ -410,8 +411,29 @@ mod impls {
             *flags |= Self::OWNED;
             NonNull::new(Self::page_alloc(len)).unwrap()
         }
-        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize { todo!() }
-        fn drop_root(&mut self) { todo!() }
+        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize {
+            if !self.check_owned(_pte) {
+                return 0;
+            }
+            unsafe {
+                dealloc(
+                    self.p_to_v::<u8>(_pte.ppn()).as_ptr(),
+                    Layout::from_size_align_unchecked(
+                        _len << Sv39::PAGE_BITS,
+                        1 << Sv39::PAGE_BITS,
+                    ),
+                );
+            }
+            _len
+        }
+        fn drop_root(&mut self) {
+            unsafe {
+                dealloc(
+                    self.0.as_ptr().cast(),
+                    Layout::from_size_align_unchecked(1 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS),
+                );
+            }
+        }
     }
 
     // ─── 控制台 ───
@@ -429,6 +451,117 @@ mod impls {
     pub struct SyscallContext;
     const READABLE: VmFlags<Sv39> = build_flags("RV");
     const WRITEABLE: VmFlags<Sv39> = build_flags("W_V");
+    const DEADLOCK_ERR: isize = -0xdead;
+
+    fn has_path_mutex(
+        proc: &ProcStruct,
+        from: ThreadId,
+        target: ThreadId,
+        visited: &mut BTreeSet<ThreadId>,
+    ) -> bool {
+        for (mutex_id, waiters) in proc.mutex_waiters.iter().enumerate() {
+            if !waiters.contains(&from) {
+                continue;
+            }
+            if let Some(owner) = proc.mutex_owner.get(mutex_id).copied().flatten() {
+                if owner == target {
+                    return true;
+                }
+                if visited.insert(owner) && has_path_mutex(proc, owner, target, visited) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn would_deadlock_mutex(proc: &ProcStruct, waiter: ThreadId, owner: ThreadId) -> bool {
+        if waiter == owner {
+            return true;
+        }
+        let mut visited = BTreeSet::new();
+        visited.insert(owner);
+        has_path_mutex(proc, owner, waiter, &mut visited)
+    }
+
+    fn would_deadlock_sem(proc: &ProcStruct, waiter: ThreadId, sem_id: usize) -> bool {
+        let m = proc.sem_total.len();
+        if sem_id >= m {
+            return false;
+        }
+
+        let mut tids = BTreeSet::new();
+        for sem in proc.sem_allocation.iter() {
+            for (&tid, &count) in sem.iter() {
+                if count > 0 {
+                    tids.insert(tid);
+                }
+            }
+        }
+        for sem in proc.sem_need.iter() {
+            for (&tid, &need) in sem.iter() {
+                if need > 0 {
+                    tids.insert(tid);
+                }
+            }
+        }
+        tids.insert(waiter);
+
+        let thread_list: Vec<ThreadId> = tids.into_iter().collect();
+        let n = thread_list.len();
+        if n == 0 {
+            return false;
+        }
+
+        let mut allocation = vec![vec![0usize; m]; n];
+        let mut need = vec![vec![0usize; m]; n];
+        for (i, tid) in thread_list.iter().enumerate() {
+            for j in 0..m {
+                allocation[i][j] = proc
+                    .sem_allocation
+                    .get(j)
+                    .and_then(|s| s.get(tid).copied())
+                    .unwrap_or(0);
+                need[i][j] = proc
+                    .sem_need
+                    .get(j)
+                    .and_then(|s| s.get(tid).copied())
+                    .unwrap_or(0);
+            }
+        }
+
+        if let Some(i) = thread_list.iter().position(|tid| *tid == waiter) {
+            need[i][sem_id] = need[i][sem_id].saturating_add(1);
+        }
+
+        let mut work = vec![0usize; m];
+        for j in 0..m {
+            let allocated_sum: usize = allocation.iter().map(|row| row[j]).sum();
+            work[j] = proc.sem_total[j].saturating_sub(allocated_sum);
+        }
+
+        let mut finish = vec![false; n];
+        loop {
+            let mut progress = false;
+            for i in 0..n {
+                if finish[i] {
+                    continue;
+                }
+                if (0..m).all(|j| need[i][j] <= work[j]) {
+                    for j in 0..m {
+                        work[j] = work[j].saturating_add(allocation[i][j]);
+                    }
+                    finish[i] = true;
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+
+        finish.iter().any(|done| !done)
+    }
 
     /// IO 系统调用（与第七章基本相同）
     ///
@@ -724,9 +857,24 @@ mod impls {
                 .find(|(_, item)| item.is_none()).map(|(id, _)| id)
             {
                 current_proc.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count)));
+                if id >= current_proc.sem_allocation.len() {
+                    current_proc.sem_allocation.resize_with(id + 1, Default::default);
+                }
+                if id >= current_proc.sem_need.len() {
+                    current_proc.sem_need.resize_with(id + 1, Default::default);
+                }
+                if id >= current_proc.sem_total.len() {
+                    current_proc.sem_total.resize(id + 1, 0);
+                }
+                current_proc.sem_allocation[id].clear();
+                current_proc.sem_need[id].clear();
+                current_proc.sem_total[id] = res_count;
                 id
             } else {
                 current_proc.semaphore_list.push(Some(Arc::new(Semaphore::new(res_count))));
+                current_proc.sem_allocation.push(Default::default());
+                current_proc.sem_need.push(Default::default());
+                current_proc.sem_total.push(res_count);
                 current_proc.semaphore_list.len() - 1
             };
             id as isize
@@ -735,9 +883,42 @@ mod impls {
         /// V 操作：释放信号量，唤醒等待线程
         fn semaphore_up(&self, _caller: Caller, sem_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let tid = unsafe { (*processor).current().unwrap().tid };
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            if sem_id >= current_proc.semaphore_list.len() || current_proc.semaphore_list[sem_id].is_none() {
+                return -1;
+            }
             let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
+
+            if sem_id < current_proc.sem_allocation.len() {
+                let mut remove = false;
+                if let Some(count) = current_proc.sem_allocation[sem_id].get_mut(&tid) {
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    remove = *count == 0;
+                }
+                if remove {
+                    current_proc.sem_allocation[sem_id].remove(&tid);
+                }
+            }
+
             if let Some(tid) = sem.up() {
+                if sem_id < current_proc.sem_need.len() {
+                    let mut remove = false;
+                    if let Some(need) = current_proc.sem_need[sem_id].get_mut(&tid) {
+                        if *need > 0 {
+                            *need -= 1;
+                        }
+                        remove = *need == 0;
+                    }
+                    if remove {
+                        current_proc.sem_need[sem_id].remove(&tid);
+                    }
+                }
+                if sem_id < current_proc.sem_allocation.len() {
+                    *current_proc.sem_allocation[sem_id].entry(tid).or_insert(0) += 1;
+                }
                 unsafe { (*processor).re_enque(tid); }
             }
             0
@@ -749,8 +930,31 @@ mod impls {
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            if sem_id >= current_proc.semaphore_list.len() || current_proc.semaphore_list[sem_id].is_none() {
+                return -1;
+            }
             let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
-            if !sem.down(tid) { -1 } else { 0 }
+            let should_block = {
+                let sem_inner = sem.inner.exclusive_access();
+                sem_inner.count <= 0
+            };
+            if should_block
+                && current_proc.deadlock_detect_enabled
+                && would_deadlock_sem(current_proc, tid, sem_id)
+            {
+                return DEADLOCK_ERR;
+            }
+            if sem.down(tid) {
+                if sem_id < current_proc.sem_allocation.len() {
+                    *current_proc.sem_allocation[sem_id].entry(tid).or_insert(0) += 1;
+                }
+                0
+            } else {
+                if sem_id < current_proc.sem_need.len() {
+                    *current_proc.sem_need[sem_id].entry(tid).or_insert(0) += 1;
+                }
+                -1
+            }
         }
 
         /// 创建互斥锁（blocking=true 为阻塞锁）
@@ -763,9 +967,19 @@ mod impls {
                 .find(|(_, item)| item.is_none()).map(|(id, _)| id)
             {
                 current_proc.mutex_list[id] = new_mutex;
+                if id >= current_proc.mutex_owner.len() {
+                    current_proc.mutex_owner.resize(id + 1, None);
+                }
+                if id >= current_proc.mutex_waiters.len() {
+                    current_proc.mutex_waiters.resize_with(id + 1, Default::default);
+                }
+                current_proc.mutex_owner[id] = None;
+                current_proc.mutex_waiters[id].clear();
                 id as isize
             } else {
                 current_proc.mutex_list.push(new_mutex);
+                current_proc.mutex_owner.push(None);
+                current_proc.mutex_waiters.push(Default::default());
                 current_proc.mutex_list.len() as isize - 1
             }
         }
@@ -773,9 +987,22 @@ mod impls {
         /// 解锁，唤醒等待线程
         fn mutex_unlock(&self, _caller: Caller, mutex_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let tid = unsafe { (*processor).current().unwrap().tid };
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            if mutex_id >= current_proc.mutex_list.len() || current_proc.mutex_list[mutex_id].is_none() {
+                return -1;
+            }
             let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
+            if mutex_id < current_proc.mutex_owner.len() && current_proc.mutex_owner[mutex_id] == Some(tid) {
+                current_proc.mutex_owner[mutex_id] = None;
+            }
             if let Some(tid) = mutex.unlock() {
+                if mutex_id < current_proc.mutex_waiters.len() {
+                    current_proc.mutex_waiters[mutex_id].remove(&tid);
+                }
+                if mutex_id < current_proc.mutex_owner.len() {
+                    current_proc.mutex_owner[mutex_id] = Some(tid);
+                }
                 unsafe { (*processor).re_enque(tid); }
             }
             0
@@ -787,8 +1014,31 @@ mod impls {
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            if mutex_id >= current_proc.mutex_list.len() || current_proc.mutex_list[mutex_id].is_none() {
+                return -1;
+            }
+            if current_proc.deadlock_detect_enabled {
+                if let Some(owner) = current_proc.mutex_owner.get(mutex_id).copied().flatten() {
+                    if would_deadlock_mutex(current_proc, tid, owner) {
+                        return DEADLOCK_ERR;
+                    }
+                }
+            }
             let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
-            if !mutex.lock(tid) { -1 } else { 0 }
+            if mutex.lock(tid) {
+                if mutex_id < current_proc.mutex_owner.len() {
+                    current_proc.mutex_owner[mutex_id] = Some(tid);
+                }
+                if mutex_id < current_proc.mutex_waiters.len() {
+                    current_proc.mutex_waiters[mutex_id].remove(&tid);
+                }
+                0
+            } else {
+                if mutex_id < current_proc.mutex_waiters.len() {
+                    current_proc.mutex_waiters[mutex_id].insert(tid);
+                }
+                -1
+            }
         }
 
         /// 创建条件变量
@@ -823,19 +1073,57 @@ mod impls {
             let current = unsafe { (*processor).current().unwrap() };
             let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            if condvar_id >= current_proc.condvar_list.len() || current_proc.condvar_list[condvar_id].is_none() {
+                return -1;
+            }
+            if mutex_id >= current_proc.mutex_list.len() || current_proc.mutex_list[mutex_id].is_none() {
+                return -1;
+            }
             let condvar = Arc::clone(current_proc.condvar_list[condvar_id].as_ref().unwrap());
             let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
+            if mutex_id < current_proc.mutex_owner.len() && current_proc.mutex_owner[mutex_id] == Some(tid) {
+                current_proc.mutex_owner[mutex_id] = None;
+            }
             let (flag, waking_tid) = condvar.wait_with_mutex(tid, mutex);
             if let Some(waking_tid) = waking_tid {
+                if mutex_id < current_proc.mutex_waiters.len() {
+                    current_proc.mutex_waiters[mutex_id].remove(&waking_tid);
+                }
+                if mutex_id < current_proc.mutex_owner.len() {
+                    current_proc.mutex_owner[mutex_id] = Some(waking_tid);
+                }
                 unsafe { (*processor).re_enque(waking_tid); }
             }
-            if !flag { -1 } else { 0 }
+            if !flag {
+                if mutex_id < current_proc.mutex_waiters.len() {
+                    current_proc.mutex_waiters[mutex_id].insert(tid);
+                }
+                -1
+            } else {
+                if mutex_id < current_proc.mutex_owner.len() {
+                    current_proc.mutex_owner[mutex_id] = Some(tid);
+                }
+                if mutex_id < current_proc.mutex_waiters.len() {
+                    current_proc.mutex_waiters[mutex_id].remove(&tid);
+                }
+                0
+            }
         }
 
         /// 死锁检测（TODO 练习题）
         fn enable_deadlock_detect(&self, _caller: Caller, is_enable: i32) -> isize {
-            tg_console::log::info!("enable_deadlock_detect: is_enable = {is_enable}, not implemented");
-            -1
+            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
+            match is_enable {
+                0 => {
+                    current_proc.deadlock_detect_enabled = false;
+                    0
+                }
+                1 => {
+                    current_proc.deadlock_detect_enabled = true;
+                    0
+                }
+                _ => -1,
+            }
         }
     }
 }
